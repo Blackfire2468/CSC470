@@ -46,6 +46,11 @@ server <- function(input, output, session) {
       r_code <- code_match[1,2]
       temp_env <- new.env(parent = globalenv())
       
+      # Show code if user asked for it
+      if (str_detect(tolower(input$chat_user_input), "code|show me|give me")) {
+        chat_append("chat", div(tags$pre(tags$code(r_code))))
+      }
+      
       result <- try(eval(parse(text = r_code), envir = temp_env), silent = TRUE)
       
       # If ggplot object → render to temp file and inject image
