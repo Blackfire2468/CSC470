@@ -141,44 +141,100 @@ server <- function(input, output, session) {
   observeEvent(input$chat_user_input, {
     req(input$chat_user_input)
     
-    df      <- active_df()
-    user_q  <- input$chat_user_input
+    df     <- active_df()
+    user_q <- input$chat_user_input
     
-    # Build a context block so the LLM knows what data is available
     data_context <- if (!is.null(df)) {
       paste0(
-        "The user has loaded the dataset `", input$ds_select,
-        "` from the `", input$pkg_select, "` package.\n",
-        "It has ", nrow(df), " rows and ", ncol(df), " columns: ",
-        paste(names(df), collapse = ", "), ".\n",
-        "When writing R code that uses this dataset, load it with:\n",
-        "  data('", input$ds_select, "', package='", input$pkg_select, "')\n",
-        "then refer to the object `", input$ds_select, "`."
+        "Currently loaded dataset: `", input$ds_select,
+        "` from package `", input$pkg_select, "`.\n",
+        "Dimensions: ", nrow(df), " rows x ", ncol(df), " columns.\n",
+        "Columns: ", paste(names(df), collapse = ", "), ".\n",
+        "In any R code you write, the data frame is already available as `",
+        input$ds_select, "` — do NOT call data() or library() to load it."
       )
     } else {
       "No dataset is currently loaded."
     }
     
-    # Prepend context invisibly to the user message
     augmented_msg <- paste0(
-      "[DATA CONTEXT — do not show this to the user]\n",
+      "[DATA CONTEXT — do not repeat this to the user]\n",
       data_context, "\n\n",
-      "User question: ", user_q
+      "User: ", user_q
     )
     
     response <- chat$chat(augmented_msg)
     
-    code_match <- str_match(response, "```r\\s*([\\s\\S]*?)```")
+    # ── 1. Parse switch tag ────────────────────────────────────────────────────
+    switch_match <- regmatches(
+      response,
+      regexpr(
+        '<switch_dataset\\s+pkg=["\']([^"\']+)["\']\\s+ds=["\']([^"\']+)["\']\\s*/>',
+        response,
+        perl = TRUE
+      )
+    )
     
-    if (!is.na(code_match[1, 2])) {
+    new_pkg <- NULL
+    new_ds  <- NULL
+    
+    if (length(switch_match) > 0) {
+      # Extract attributes directly from the matched tag
+      new_pkg <- sub('.*pkg=["\']([^"\']+)["\'].*', '\\1', switch_match)
+      new_ds  <- sub('.*ds=["\']([^"\']+)["\'].*',  '\\1', switch_match)
       
-      r_code  <- code_match[1, 2]
+      # Strip tag from displayed response
+      response <- str_trim(
+        gsub(
+          '<switch_dataset\\s+pkg=["\']([^"\']+)["\']\\s+ds=["\']([^"\']+)["\']\\s*/>',
+          '',
+          response,
+          perl = TRUE
+        )
+      )
+      
+      # Validate and apply the switch
+      if (new_pkg %in% pkg_list) {
+        new_datasets <- get_package_datasets(new_pkg)
+        
+        if (new_ds %in% new_datasets) {
+          # Update package first, then immediately update dataset choices + selection
+          updateSelectInput(session, "pkg_select", selected = new_pkg)
+          updateSelectInput(session, "ds_select",
+                            choices  = new_datasets,
+                            selected = new_ds)
+        } else {
+          # Dataset name didn't match exactly — try case-insensitive fallback
+          ci_match <- new_datasets[tolower(new_datasets) == tolower(new_ds)]
+          if (length(ci_match) == 1) {
+            new_ds <- ci_match
+            updateSelectInput(session, "pkg_select", selected = new_pkg)
+            updateSelectInput(session, "ds_select",
+                              choices  = new_datasets,
+                              selected = new_ds)
+          }
+        }
+      }
+    }
+    
+    # ── 2. Execute R code block ────────────────────────────────────────────────
+    code_match <- regmatches(
+      response,
+      regexpr("(?i)```r\\s*([\\s\\S]*?)```", response, perl = TRUE)
+    )
+    
+    if (length(code_match) > 0) {
+      r_code   <- sub("(?i)```r\\s*", "", code_match, perl = TRUE)
+      r_code   <- sub("```$", "", r_code)
+      
       temp_env <- new.env(parent = globalenv())
       
-      # Make the active dataset available in the eval environment
-      if (!is.null(df)) {
-        assign(input$ds_select, df, envir = temp_env)
-      }
+      # Use the switched dataset if a switch just happened, otherwise current
+      eval_pkg <- if (!is.null(new_pkg) && new_pkg %in% pkg_list) new_pkg else input$pkg_select
+      eval_ds  <- if (!is.null(new_ds))  new_ds  else input$ds_select
+      eval_df  <- load_dataset(eval_pkg, eval_ds)
+      
+      if (!is.null(eval_df)) assign(eval_ds, eval_df, envir = temp_env)
       
       result <- try(eval(parse(text = r_code), envir = temp_env), silent = TRUE)
       
@@ -188,33 +244,13 @@ server <- function(input, output, session) {
         img_data <- base64enc::dataURI(file = file, mime = "image/png")
         chat_append(
           "chat",
-          div(tags$img(src = img_data,
-                       style = "max-width:100%; border-radius:12px;"))
+          div(tags$img(src = img_data, style = "max-width:100%; border-radius:12px;"))
         )
-      } else {
-        # Still show the text response even if code ran
-        chat_append("chat", response)
+        return()
       }
-      
-    } else {
-      chat_append("chat", response)
     }
     
-    # ── switch the sidebar to the dataset the bot referenced ─────────────────
-    # If the response mentions a package::dataset pattern, switch the UI to it
-    ref_match <- str_match(response, "`?(\\w+)::(\\w+)`?")
-    if (!is.na(ref_match[1, 2])) {
-      ref_pkg <- ref_match[1, 2]
-      ref_ds  <- ref_match[1, 3]
-      if (ref_pkg %in% pkg_list) {
-        updateSelectInput(session, "pkg_select", selected = ref_pkg)
-        # slight delay so dataset list updates first
-        later::later(function() {
-          updateSelectInput(session, "ds_select", selected = ref_ds)
-        }, delay = 0.3)
-      }
-    }
+    chat_append("chat", response)
   })
-}
 
 shinyApp(ui, server)
